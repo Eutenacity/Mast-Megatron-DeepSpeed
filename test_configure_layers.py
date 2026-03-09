@@ -1,0 +1,2235 @@
+import argparse
+import torch
+from torch import nn
+from torch import distributed as dist
+from torch.nn import functional as F
+from torch._C._distributed_c10d import ProcessGroup
+
+import math
+import numpy as np
+_groups = None
+from torch import Tensor
+from tutel import moe as tutel_moe
+from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+# from tutel.impls.overlap import a2a_ffn_overlap_forward
+class _A2A_FFN_BakByHand(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,  x,bak_fun,input):
+        
+        ctx.bak_fun=bak_fun
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return None,None,ctx.bak_fun(grad_output)
+def bak_a2a_ffn_ol(grad_output,a2afn,a2a_ffn_overlap_degree,experts_input,experts_output):
+    split_dim=1
+    split_size = grad_output.shape[1] // a2a_ffn_overlap_degree
+    grad_split = list(grad_output.split(split_size, dim=1))
+    for i in range(a2a_ffn_overlap_degree):
+        grad_split[i] = grad_split[i].contiguous()
+    s.wait_stream(torch.cuda.current_stream())
+    for i in range(a2a_ffn_overlap_degree):
+        with torch.cuda.stream(s):
+            grad_split[i] = a2afn(grad_split[i])
+            events_list[3][i].record()
+    for i in range(a2a_ffn_overlap_degree):
+        events_list[3][i].wait()
+        experts_input[i].retain_grad()
+        torch.autograd.backward(experts_output[i], grad_tensors=grad_split[i])
+        grad_split[i]=experts_input[i].grad
+        events_list[4][i].record()
+        with torch.cuda.stream(s):
+            events_list[4][i].wait()
+            grad_split[i] = a2afn(grad_split[i])
+    torch.cuda.current_stream().wait_stream(s)
+    
+    output = torch.cat(grad_split, dim=1)
+
+    return output
+def a2a_ffn_overlap_new(input,expert_fn,a2a_ffn_overlap_degree,a2afn):
+    split_dim=1
+    
+    split_size = input.shape[1] // a2a_ffn_overlap_degree
+    input_split = list(input.split(split_size, dim=1))
+    
+    experts_input = []
+    experts_output = []
+    for i in range(a2a_ffn_overlap_degree):
+        input_split[i] = input_split[i].contiguous()
+    s.wait_stream(torch.cuda.current_stream())
+    for i in range(a2a_ffn_overlap_degree):
+        with torch.cuda.stream(s):
+            input_split[i] = a2afn(input_split[i])
+            events_list[3][i].record()
+    for i in range(a2a_ffn_overlap_degree):
+        events_list[3][i].wait()
+        input_split[i] = input_split[i].detach()
+        input_split[i].requires_grad= True
+        experts_input.append(input_split[i])
+       
+        input_split[i]=expert_fn(input_split[i])
+        
+        experts_output.append(input_split[i])
+        events_list[4][i].record()
+        with torch.cuda.stream(s):
+            events_list[4][i].wait()
+            input_split[i] = a2afn(input_split[i])
+    
+    torch.cuda.current_stream().wait_stream(s)
+    
+    output = torch.cat(input_split, dim=1)
+
+    output = output.detach()
+    output.requires_grad = True
+    def bak_fun(grad):
+        return bak_a2a_ffn_ol(grad,a2afn,a2a_ffn_overlap_degree,experts_input,experts_output)
+    output = _A2A_FFN_BakByHand.apply(output,bak_fun,input)
+    return output
+def _split(group: ProcessGroup, input_, dim):
+    world_size = dist.get_world_size(group)
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    assert input_.size(dim) % world_size == 0, '{} is not divisible by {}'.format(
+        input_.size(dim), world_size)
+    dim_size = input_.size(dim) // world_size
+    input_list = torch.split(input_, dim_size, dim=dim)
+    rank = dist.get_rank(group)
+    output = input_list[rank].contiguous()
+    return output
+def _ori_gather(group: ProcessGroup, input_, dim, tensor_list_tmp=None):
+    world_size = dist.get_world_size(group) if group is not None else 1
+    # Bypass the function if we are using only 1 GPU.
+    if world_size == 1:
+        return input_
+
+    ag_input=input_
+    if tensor_list_tmp is not None:
+        tensor_list=tensor_list_tmp
+    else:
+        tensor_list=torch.empty((ag_input.shape[0],dist.get_world_size(group=group) * ag_input.shape[1],)+ag_input.shape[2:], dtype=ag_input.dtype, device=ag_input.device)
+
+    group._allgather_base(tensor_list,ag_input).wait()
+    output=tensor_list
+    return output
+def _ori_reduce_scatter(group: ProcessGroup, input_, rs_output, dim):
+    world_size = dist.get_world_size(group)
+    if world_size == 1:
+        return input_
+
+    assert input_.size(dim) % world_size == 0, '{} is not divisible by {}'.format(
+        input_.size(dim), world_size)
+    torch.distributed._reduce_scatter_base(rs_output, input_, group=group)
+    return rs_output
+class _OriReduceScatter(torch.autograd.Function):
+    @staticmethod
+    def symbolic(graph, group, input_, rs_output,dim):
+        return _ori_reduce_scatter(group, input_, rs_output,dim)
+
+    @staticmethod
+    def forward(ctx, group, input_, rs_output,dim):
+        ctx.dim = dim
+        ctx.group = group
+        ctx.tensor_list=torch.empty_like(input_)
+
+        return _ori_reduce_scatter(group, input_,rs_output, dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return None, _ori_gather(ctx.group, grad_output, ctx.dim,ctx.tensor_list), None,None
+def ori_reduce_scatter(group, input_, rs_output,dim):
+    return _OriReduceScatter.apply(group, input_, rs_output,dim)
+class _OriGatherFromModelParallelRegion(torch.autograd.Function):
+    """Gather the input from model parallel region and concatinate."""
+
+    @staticmethod
+    def symbolic(graph, group,  input_, dim,tensor_list_tmp):
+        return _ori_gather(group, input_, dim,tensor_list_tmp)
+
+    @staticmethod
+    def forward(ctx, group,  input_, dim,tensor_list_tmp):
+        ctx.dim = dim
+        ctx.group = group
+        ctx.grad_dummy=input_
+        return _ori_gather(group, input_, dim,tensor_list_tmp)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return None,ctx.grad_dummy, None,grad_output
+def ori_gather(group, input_, dim,tensor_list_tmp):
+    return _OriGatherFromModelParallelRegion.apply(group, input_, dim,tensor_list_tmp)
+class CudaEventTimer(object):
+    def __init__(self, start_event: torch.cuda.Event, end_event: torch.cuda.Event):
+        self.start_event = start_event
+        self.end_event = end_event
+
+    def get_elapsed_msec(self):
+        torch.cuda.current_stream().wait_event(self.end_event)
+        self.end_event.synchronize()
+        return self.start_event.elapsed_time(self.end_event)
+
+
+class SynchronizedWallClockTimer:
+    """Group of timers. Borrowed from Nvidia Megatron code"""
+    class Timer:
+        """Timer."""
+        def __init__(self, name):
+            self.name_ = name
+            self.started_ = False
+            self.event_timers = []
+            self.start_event = None
+            self.elapsed_records = None
+
+        def start(self):
+            """Start the timer."""
+            assert not self.started_, f"{self.name_} timer has already been started"
+            self.start_event = torch.cuda.Event(enable_timing=True)
+            self.start_event.record()
+            self.started_ = True
+
+        def stop(self, reset=False, record=False):
+            """Stop the timer."""
+            assert self.started_, "timer is not started"
+            end_event = torch.cuda.Event(enable_timing=True)
+            end_event.record()
+            self.event_timers.append(CudaEventTimer(self.start_event, end_event))
+            self.start_event = None
+            self.started_ = False
+
+        def _get_elapsed_msec(self):
+            self.elapsed_records = [et.get_elapsed_msec() for et in self.event_timers]
+            self.event_timers.clear()
+            return sum(self.elapsed_records)
+
+        def reset(self):
+            """Reset timer."""
+            self.started_ = False
+            self.start_event = None
+            self.elapsed_records = None
+            self.event_timers.clear()
+
+        def elapsed(self, reset=True):
+            """Calculate the elapsed time."""
+            started_ = self.started_
+            # If the timing in progress, end it first.
+            if self.started_:
+                self.stop()
+            # Get the elapsed time.
+            elapsed_ = self._get_elapsed_msec()
+            # Reset the elapsed time
+            if reset:
+                self.reset()
+            # If timing was in progress, set it back.
+            if started_:
+                self.start()
+            return elapsed_
+
+        def mean(self,trim_percent=0.1):
+            self.elapsed(reset=False)
+            m,s=trim_mean(self.elapsed_records, trim_percent)
+            return m,s
+
+    def __init__(self):
+        self.timers = {}
+
+    def get_timers(self):
+        return self.timers
+
+    def __call__(self, name):
+        if name not in self.timers:
+            self.timers[name] = self.Timer(name)
+        return self.timers[name]
+
+    @staticmethod
+    def memory_usage():
+        alloc = "mem_allocated: {:.4f} GB".format(torch.cuda.memory_allocated() /
+                                                  (1024 * 1024 * 1024))
+        max_alloc = "max_mem_allocated: {:.4f} GB".format(
+            torch.cuda.max_memory_allocated() / (1024 * 1024 * 1024))
+        cache = "cache_allocated: {:.4f} GB".format(torch.cuda.memory_cached() /
+                                                    (1024 * 1024 * 1024))
+        max_cache = "max_cache_allocated: {:.4f} GB".format(
+            torch.cuda.max_memory_cached() / (1024 * 1024 * 1024))
+        return " | {} | {} | {} | {}".format(alloc, max_alloc, cache, max_cache)
+
+
+
+    def get_mean(self, names, normalizer=1.0, reset=True):
+        """Get the mean of a group of timers."""
+        assert normalizer > 0.0
+        means = {}
+        for name in names:
+            if name in self.timers:
+                elapsed_time = (self.timers[name].mean() * 1000.0 / normalizer)
+                means[name] = elapsed_time
+        return means
+import numpy as np
+def trim_mean(data, trim_percent):
+    """Compute the trimmed mean of a list of numbers.
+
+    Args:
+        data (list): List of numbers.
+        trim_percent (float): Percentage of data to trim.
+
+    Returns:
+        float: Trimmed mean.
+    """
+    assert trim_percent >= 0.0 and trim_percent <= 1.0
+    n = len(data)
+    # Account for edge case of empty list
+    if len(data) == 0:
+        return 0,0
+    data.sort()
+    k = int(round(n * (trim_percent)))
+    m=np.mean(data[k:n - k])
+    s=np.std(data[k:n - k])
+    return m,s
+
+def apply_mask_to_padding_states(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+    return hidden_states
+
+
+# is_fast_path_available = all(
+#     (causal_conv1d_fn, causal_conv1d_update, chunk_gated_delta_rule, fused_recurrent_gated_delta_rule)
+# )
+def l2norm(x: torch.FloatTensor, dim: int = -1, eps: float = 1e-6):
+    """This function is intended to align with the l2norm implementation in the FLA library."""
+    inv_norm = torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+    return x * inv_norm
+def torch_chunk_gated_delta_rule(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    chunk_size=64,
+    initial_state=None,
+    output_final_state=False,
+    use_qk_l2norm_in_kernel=False,
+):
+    initial_dtype = query.dtype
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+    query = F.pad(query, (0, 0, 0, pad_size))
+    key = F.pad(key, (0, 0, 0, pad_size))
+    value = F.pad(value, (0, 0, 0, pad_size))
+    beta = F.pad(beta, (0, pad_size))
+    g = F.pad(g, (0, pad_size))
+    total_sequence_length = sequence_length + pad_size
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    v_beta = value * beta.unsqueeze(-1)
+    k_beta = key * beta.unsqueeze(-1)
+    # reshape to chunks
+    query, key, value, k_beta, v_beta = [
+        x.reshape(x.shape[0], x.shape[1], -1, chunk_size, x.shape[-1]) for x in (query, key, value, k_beta, v_beta)
+    ]
+    g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0)
+
+    # chunk decay
+    g = g.cumsum(dim=-1)
+    decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
+    attn = -((k_beta @ key.transpose(-1, -2)) * decay_mask).masked_fill(mask, 0)
+    for i in range(1, chunk_size):
+        row = attn[..., i, :i].clone()
+        sub = attn[..., :i, :i].clone()
+        attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+    attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=attn.device)
+    value = attn @ v_beta
+    k_cumdecay = attn @ (k_beta * g.exp().unsqueeze(-1))
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+    core_attn_out = torch.zeros_like(value)
+    mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1)
+
+    # for each chunk
+    for i in range(0, total_sequence_length // chunk_size):
+        q_i, k_i, v_i = query[:, :, i], key[:, :, i], value[:, :, i]
+        attn = (q_i @ k_i.transpose(-1, -2) * decay_mask[:, :, i]).masked_fill_(mask, 0)
+        v_prime = (k_cumdecay[:, :, i]) @ last_recurrent_state
+        v_new = v_i - v_prime
+        attn_inter = (q_i * g[:, :, i, :, None].exp()) @ last_recurrent_state
+        core_attn_out[:, :, i] = attn_inter + attn @ v_new
+        last_recurrent_state = (
+            last_recurrent_state * g[:, :, i, -1, None, None].exp()
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        )
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1])
+    core_attn_out = core_attn_out[:, :, :sequence_length]
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+
+
+def torch_recurrent_gated_delta_rule(
+    query, key, value, g, beta, initial_state, output_final_state, use_qk_l2norm_in_kernel=False
+):
+    initial_dtype = query.dtype
+    if use_qk_l2norm_in_kernel:
+        query = l2norm(query, dim=-1, eps=1e-6)
+        key = l2norm(key, dim=-1, eps=1e-6)
+    query, key, value, beta, g = [
+        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+    ]
+
+    batch_size, num_heads, sequence_length, k_head_dim = key.shape
+    v_head_dim = value.shape[-1]
+    scale = 1 / (query.shape[-1] ** 0.5)
+    query = query * scale
+
+    core_attn_out = torch.zeros(batch_size, num_heads, sequence_length, v_head_dim).to(value)
+    last_recurrent_state = (
+        torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim).to(value)
+        if initial_state is None
+        else initial_state.to(value)
+    )
+
+    for i in range(sequence_length):
+        q_t = query[:, :, i]
+        k_t = key[:, :, i]
+        v_t = value[:, :, i]
+        g_t = g[:, :, i].exp().unsqueeze(-1).unsqueeze(-1)
+        beta_t = beta[:, :, i].unsqueeze(-1)
+
+        last_recurrent_state = last_recurrent_state * g_t
+        kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
+        delta = (v_t - kv_mem) * beta_t
+        last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
+        core_attn_out[:, :, i] = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
+
+    if not output_final_state:
+        last_recurrent_state = None
+    core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
+    return core_attn_out, last_recurrent_state
+class Qwen3NextRMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, gate=None):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        # Norm before gate
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        hidden_states = self.weight * hidden_states.to(input_dtype)
+        hidden_states = hidden_states * F.silu(gate.to(torch.float32))
+
+        return hidden_states.to(input_dtype)
+class Silu(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self,x,y):
+        return x*F.silu(y)
+class Qwen3NextGatedDeltaNet(nn.Module):
+    def __init__(self, args, mp_group):
+        super().__init__()
+        self.mp_group = mp_group
+        self.hidden_size = args.M
+        self.num_v_heads = 32 // args.mp_size
+        self.num_k_heads = 16 // args.mp_size
+        self.head_k_dim = 128
+        self.head_v_dim = 128
+        self.key_dim = self.head_k_dim * self.num_k_heads
+        self.value_dim = self.head_v_dim * self.num_v_heads
+
+        self.conv_kernel_size = 4
+        self.layer_idx = 1
+        self.act = Silu()
+        self.layer_norm_epsilon = 1e-6
+
+        # QKV
+        self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=False,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+
+        # projection of the input hidden states
+        projection_size_qkvz = self.key_dim * 2 + self.value_dim * 2
+        projection_size_ba = self.num_v_heads * 2
+        self.in_proj_qkvz = nn.Linear(self.hidden_size, projection_size_qkvz, bias=False)
+        self.in_proj_ba = nn.Linear(self.hidden_size, projection_size_ba, bias=False)
+
+        # time step projection (discretization)
+        # instantiate once and copy inv_dt in init_weights of PretrainedModel
+        self.dt_bias = nn.Parameter(torch.ones(self.num_v_heads))
+
+        A = torch.empty(self.num_v_heads).uniform_(0, 16)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        self.norm = (
+            Qwen3NextRMSNormGated(self.head_v_dim, eps=self.layer_norm_epsilon)
+            
+        )
+
+        self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+        self.causal_conv1d_fn = None
+        self.chunk_gated_delta_rule = chunk_gated_delta_rule or torch_chunk_gated_delta_rule
+        self.recurrent_gated_delta_rule = fused_recurrent_gated_delta_rule or torch_recurrent_gated_delta_rule
+
+       
+
+    def fix_query_key_value_ordering(self, mixed_qkvz, mixed_ba):
+        """
+        Derives `query`, `key` and `value` tensors from `mixed_qkvz` and `mixed_ba`.
+        """
+
+        new_tensor_shape_qkvz = mixed_qkvz.size()[:-1] + (
+            self.num_k_heads,
+            2 * self.head_k_dim + 2 * self.head_v_dim * self.num_v_heads // self.num_k_heads,
+        )
+        new_tensor_shape_ba = mixed_ba.size()[:-1] + (self.num_k_heads, 2 * self.num_v_heads // self.num_k_heads)
+
+        mixed_qkvz = mixed_qkvz.view(*new_tensor_shape_qkvz)
+        mixed_ba = mixed_ba.view(*new_tensor_shape_ba)
+        split_arg_list_qkvz = [
+            self.head_k_dim,
+            self.head_k_dim,
+            (self.num_v_heads // self.num_k_heads * self.head_v_dim),
+            (self.num_v_heads // self.num_k_heads * self.head_v_dim),
+        ]
+        split_arg_list_ba = [self.num_v_heads // self.num_k_heads, self.num_v_heads // self.num_k_heads]
+        query, key, value, z = torch.split(mixed_qkvz, split_arg_list_qkvz, dim=3)
+        b, a = torch.split(mixed_ba, split_arg_list_ba, dim=3)
+        # [b, sq, ng, np/ng * hn] -> [b, sq, np, hn]
+        value = value.reshape(value.size(0), value.size(1), -1, self.head_v_dim)
+        z = z.reshape(z.size(0), z.size(1), -1, self.head_v_dim)
+        b = b.reshape(b.size(0), b.size(1), self.num_v_heads)
+        a = a.reshape(a.size(0), a.size(1), self.num_v_heads)
+        return query, key, value, z, b, a
+
+    def forward(
+        self,
+        hidden_states,
+    ):
+        if not hasattr(self, 'attention_mask'):
+            self.attention_mask = torch.tril(torch.ones(
+    (1, seq, seq), device=hidden_states.device)).view(
+            1, 1, seq, seq)
+            self.attention_mask = (self.attention_mask < 0.5)
+        hidden_states = apply_mask_to_padding_states(hidden_states, self.attention_mask)
+
+        # Set up dimensions for reshapes later
+        batch_size, seq_len, _ = hidden_states.shape
+        use_precomputed_states = False
+
+        # getting projected states from cache if it exists
+        
+        projected_states_qkvz = self.in_proj_qkvz(hidden_states)
+        projected_states_ba = self.in_proj_ba(hidden_states)
+        query, key, value, z, b, a = self.fix_query_key_value_ordering(projected_states_qkvz, projected_states_ba)
+        query, key, value = (x.reshape(x.shape[0], x.shape[1], -1) for x in (query, key, value))
+
+        mixed_qkv = torch.cat((query, key, value), dim=-1)
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+
+       
+           
+        if self.causal_conv1d_fn is not None:
+            mixed_qkv = self.causal_conv1d_fn(
+                x=mixed_qkv,
+                weight=self.conv1d.weight.squeeze(1),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+                seq_idx=None,
+            )
+        else:
+            mixed_qkv = F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])
+
+        mixed_qkv = mixed_qkv.transpose(1, 2)
+        query, key, value = torch.split(
+            mixed_qkv,
+            [
+                self.key_dim,
+                self.key_dim,
+                self.value_dim,
+            ],
+            dim=-1,
+        )
+        query = query.reshape(query.shape[0], query.shape[1], -1, self.head_k_dim)
+        key = key.reshape(key.shape[0], key.shape[1], -1, self.head_k_dim)
+        value = value.reshape(value.shape[0], value.shape[1], -1, self.head_v_dim)
+
+        beta = b.sigmoid()
+        # If the model is loaded in fp16, without the .float() here, A might be -inf
+        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
+        if self.num_v_heads // self.num_k_heads > 1:
+            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        
+        query = query.to(torch.bfloat16)
+        key = key.to(torch.bfloat16)
+        value = value.to(torch.bfloat16)
+        core_attn_out, last_recurrent_state = self.chunk_gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+        )
+        core_attn_out = core_attn_out.to(hidden_states.dtype)
+       
+
+        # Update cache
+        z_shape_og = z.shape
+        # reshape input data into 2D tensor
+        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
+        z = z.reshape(-1, z.shape[-1])
+        core_attn_out = self.norm(core_attn_out, z)
+        core_attn_out = core_attn_out.reshape(z_shape_og)
+        core_attn_out = core_attn_out.reshape(core_attn_out.shape[0], core_attn_out.shape[1], -1)
+
+        output = self.out_proj(core_attn_out)
+         
+        res_input=hidden_states
+        if self.mp_group:
+            mp_rank=dist.get_rank(self.mp_group)
+            world_size=dist.get_world_size(self.mp_group)
+            rs_output=output.split(output.shape[1]//world_size,dim=1)[mp_rank]
+            res_input=res_input.split(res_input.shape[1]//world_size,dim=1)[mp_rank]
+        else:
+            rs_output=output
+        
+        return output,res_input,rs_output
+
+
+class OrdersFunc:
+    def __init__(self,s,s1,d1,d2,mp_group,batch_size,events_list) -> None:
+        self.s=s
+        self.s1=s1
+        self.d1=d1
+        self.d2=d2
+        self.mp_group=mp_group
+        self.mp_size=dist.get_world_size(group=mp_group) if mp_group is not None else 1
+        self.B=batch_size
+        self.events_list=events_list
+    def backward_with_order(self,grad):
+        bak_func_list=self.bak_func_list
+        order_bak=self.order_bak
+        s=self.s
+        d1=self.d1
+        inp=self.input
+        input_tensors=self.input_tensors
+        output_tensors=self.output_tensors
+        events_list=self.events_list
+        bak_counts=[0]*9
+        
+        bak_gate_pre=[0]*self.d1
+        rs_size_store=0
+        rs_count=0
+        base=self.d1*self.d2
+        rs_thr=base//self.d1
+        for i in range(self.d2):
+            rs_size_store+=base//self.d2
+            while rs_size_store>=rs_thr:
+                rs_size_store-=rs_thr
+                bak_gate_pre[rs_count]=i
+                rs_count+=1
+
+        gard_arg_af=[]
+        share_grad = [None]*d1
+        share_grad_inp = [None]*d1
+        gard_arg=list(grad.split(grad.shape[0]//self.d2,dim=0))
+        def get_bak_num(id):
+            out=bak_counts[id]
+            bak_counts[id]+=1
+            return out
+        def check_bak_event(id,num):
+            if id==6:
+                return
+            events_list[id+1][num].wait()
+        def bakprogress(item,inarg):
+            num=get_bak_num(item)
+            if item==1:#rs_bak
+                check_bak_event(item,bak_gate_pre[num])
+                
+            else:
+                check_bak_event(item,num)
+
+            if item == 2:
+                inarg[num] = (*inarg[num],share_grad_inp[num])
+            inarg[num]=bak_func_list[item](input_tensors[item][num],output_tensors[item][num],inarg[num],item)
+            if item == 6:
+                
+                share_grad[num] = inarg[num][-2]
+                
+                inarg[num] = inarg[num][:-2] + inarg[num][-1:]
+            input_tensors[item][num]=None
+            output_tensors[item][num]=None
+            events_list[item][num].record()
+           
+            return num    
+        micro_b=self.B//d1
+        rs_store=torch.tensor([],dtype=inp.dtype).cuda()
+        res_store=torch.tensor([],dtype=inp.dtype).cuda()
+        self.pre_ptr=0
+        rs_thr=inp.shape[0]*inp.shape[1]//d1//self.mp_size
+
+        post_ptr=0
+        for i in range(d1):
+            gard_arg_af.append((None,))
+        # bak_func_list=[self.backward_step,self.mp_bak,self.backward_step,self.a2a_bak,self.backward_step,self.a2a_bak,self.before_gather_bak,None]
+
+        for item in order_bak:
+  
+            inarg=gard_arg_af if item in [0,1] else gard_arg
+            num=bak_counts[item]
+
+            if item == 8:
+                num=get_bak_num(item)
+                share_grad_inp[num]=(bak_func_list[item](input_tensors[item][num],output_tensors[item][num],(share_grad[num]),item))
+                input_tensors[item][num]=None
+                output_tensors[item][num]=None
+            if item in [0,2,4]:
+                if item ==0:
+                    num=bakprogress(item,inarg)
+                elif item ==2:
+                    num=bakprogress(item,inarg)
+                else:
+                    num=bakprogress(item,inarg)
+                if item ==2:
+                    while self.pre_ptr<=num:
+                    
+                        rs_store=torch.cat([rs_store,gard_arg[self.pre_ptr][0].reshape(-1,gard_arg[self.pre_ptr][0].shape[-1])],dim=0)
+                        res_store=torch.cat([res_store,gard_arg[self.pre_ptr][1].reshape(-1,gard_arg[self.pre_ptr][1].shape[-1])],dim=0)
+                        self.pre_ptr+=1
+                    while rs_store.shape[0]>=rs_thr:
+                        slice_rs=rs_store[:rs_thr]
+                        rs_store=rs_store[rs_thr:]
+                        slice_res=res_store[:rs_thr]
+                        res_store=res_store[rs_thr:]
+
+                        slice_rs=slice_rs.reshape(micro_b,-1,slice_rs.shape[-1])
+                        if self.mp_group is not None:
+
+                            tensor_list=torch.empty((micro_b, dist.get_world_size(group=self.mp_group)* slice_rs.shape[1],)+slice_rs.shape[2:], dtype=slice_rs.dtype, device=slice_rs.device)
+                        else:
+                            tensor_list=None
+                        gard_arg_af[post_ptr]=(slice_rs,slice_res.reshape(micro_b,-1,slice_res.shape[-1]),tensor_list)
+                        post_ptr+=1
+                    events_list[item][num].record()
+
+            elif item in [3,5]:
+                with torch.cuda.stream(s):
+                    
+                    bakprogress(item,inarg)
+                   
+            elif item == 1:
+                with torch.cuda.stream(s):
+                    bakprogress(item,inarg)
+            elif item in [6]:
+                bakprogress(item,inarg)
+        torch.cuda.current_stream().wait_stream(s)
+        for i in range(self.d1):
+            gard_arg_af[i]=gard_arg_af[i][0]
+        grad_output=torch.cat(gard_arg_af)   
+        self.input.backward(grad_output)
+    def forward_with_order(self,inp,func_list,orders,bak_func_list,order_bak):
+        self.bak_func_list=bak_func_list
+        self.order_bak=order_bak
+        self.input=inp
+        inp=inp.detach()
+        input_tensors=[[[] for _ in range(self.d1)] for _ in range(2)]+[[[]for _ in range(self.d2)] for _ in range(7)]
+        output_tensors=[[[] for _ in range(self.d1)]for _ in range(2)]+[[[]for _ in range(self.d2)]for _ in range(7)]
+        d1=self.d1
+        d2=self.d2
+        events_list=self.events_list
+        s=self.s
+        s1=self.s1
+        rs_thr=inp.shape[0]*inp.shape[1]//d2//self.mp_size
+        # func_list=[self.attention,self.simple_mp_operate,self.gate_op,self.simplea2a,self.expt,self.simplea2a,self.before_gather,self.simple_gather_op]
+        inp_list=inp.split(inp.shape[0]//d1,dim=0)
+      
+        
+        counts=[0,0,0,0,0,0,0,0,0]
+        outarg=[]
+        outarg_after=[]
+     
+        
+
+        ###准备输入参数
+        for i in range(d1):
+            inp_list[i].requires_grad=True
+            outarg.append((inp_list[i],))
+        for i in range(d2):
+            outarg_after.append((None,))
+        self.rs_store=torch.tensor([],dtype=inp.dtype).cuda()
+        self.res_store=torch.tensor([],dtype=inp.dtype).cuda()
+        self.pre_ptr=0
+        share_inps = [None]*d1
+        share_oups = [None]*d1
+        def check_event(id,num):
+            if id==0:
+                return 
+            events_list[id-1][num].wait()
+        def get_num(id):
+            out=counts[id]
+            counts[id]+=1
+            return out
+        def progress(item,inarg):
+            
+            num=get_num(item)
+            
+            if item==2:#gate
+                check_event(item,gate_pre[num])
+                while self.pre_ptr<=gate_pre[num]:
+                    self.rs_store=torch.cat([self.rs_store,outarg[self.pre_ptr][0].reshape(-1,outarg[self.pre_ptr][0].shape[-1])],dim=0)
+                    self.res_store=torch.cat([self.res_store,outarg[self.pre_ptr][1].reshape(-1,outarg[self.pre_ptr][1].shape[-1])],dim=0)
+                    self.pre_ptr+=1
+                slice_rs=self.rs_store[:rs_thr]
+                self.rs_store=self.rs_store[rs_thr:]
+                slice_res=self.res_store[:rs_thr]
+                self.res_store=self.res_store[rs_thr:]
+
+                slice_rs=slice_rs.detach()
+                slice_rs.requires_grad=True
+
+                slice_res=slice_res.detach()
+                slice_res.requires_grad=True
+
+                inarg[num]=(slice_rs,slice_res)
+            else:
+                check_event(item,num)
+            if item in [0,2,4,6]:
+                # inarg[num][0].retain_grad()
+                if item == 6:
+                    inarg[num]=(*inarg[num],share_oups[num])
+                input_tensors[item][num]=inarg[num]
+                
+                # if dist.get_rank()==0:
+                #     print(str(item)+'************'+str(input_tensors))
+            #     print(str(item)+str(inarg[num][0].shape))
+            
+            inarg[num]=func_list[item](*inarg[num])
+            if item == 2:
+                share_inps[num] = inarg[num][-1]
+                
+            if item in [1,3,5]:
+                if item in [1]:
+                    tmp=inarg[num][0].detach()
+                    tmp1=inarg[num][1].detach()
+                    tmp.requires_grad=True
+                    tmp1.requires_grad=True
+                    inarg[num]=(tmp,tmp1)+inarg[num][2:]
+                else:
+                    tmp=inarg[num][0].detach()
+                    tmp.requires_grad=True
+                    inarg[num]=(tmp,)+inarg[num][1:]
+                
+            if item == 7:
+                inarg[num]=inarg[num].detach()
+                inarg[num].requires_grad=True
+            events_list[item][num].record()
+            if item in [0,2,4,6]:
+                output_tensors[item][num]=inarg[num]
+                if item == 2:
+                    inarg[num] = inarg[num][:-1]
+            return num
+        
+        rs_count=0
+        gate_pre=[0]*d2
+        rs_size_store=0
+        prenumag=0
+        preitemag=-1
+        prenuma2a=0
+        preitema2a=-1
+        
+        for item in orders:
+            # if dist.get_rank()==0:
+            #     print("begin:{}".format(item))
+            ###attention,reduce
+            if item in [0]:
+                progress(item,outarg)
+            elif item == 8:
+                num=get_num(item)
+                share_inps[num] = share_inps[num].detach()
+                share_inps[num].requires_grad=True
+                share_oups[num]=func_list[-1](share_inps[num])
+                
+                input_tensors[item][num] = (share_inps[num])
+                output_tensors[item][num] = (share_oups[num])
+                share_oups[num] = share_oups[num].detach()
+                share_oups[num].requires_grad=True
+            elif item in [1]:
+                
+                with torch.cuda.stream(s):
+                    num=progress(item,outarg)
+                # print(outarg[num][0].shape)
+                rs_size_store+=outarg[num][0].shape[0]*outarg[num][0].shape[1]
+                while rs_size_store>=rs_thr:
+                    rs_size_store-=rs_thr
+                    gate_pre[rs_count]=num
+                    rs_count+=1
+            ###gate,a2a,exp,gather
+            elif item in [2,4,6]:
+                progress(item,outarg_after)
+            elif item in [3,5,7]:
+                
+                with torch.cuda.stream(s):
+                    if preitema2a!=-1:
+                        events_list[preitema2a][prenuma2a].wait()
+                    if preitemag!=-1:
+                        events_list[preitemag][prenumag].wait()
+                    num=progress(item,outarg_after)
+                if item in [3,5]:
+                    prenuma2a=num
+                    preitema2a=item
+            elif item in [37,73,57,75]:
+                # progress(5,outarg_after)
+                # progress(6,outarg_after)
+                i1=item//10
+                i2=item%10
+                # if dist.get_rank()==0:
+                #     print("**")
+                #     print(counts[7])
+                with torch.cuda.stream(s1):
+                    if preitema2a!=-1:
+                        events_list[preitema2a][prenuma2a].wait()
+                with torch.cuda.stream(s):
+                    if preitemag!=-1:
+                        events_list[preitemag][prenumag].wait()
+                if i2==7:
+                    with torch.cuda.stream(s):
+                        num1=progress(i1,outarg_after)
+                    with torch.cuda.stream(s1):
+                        num2=progress(i2,outarg_after)
+                    prenuma2a=num1
+                    preitema2a=i1
+                    prenumag=num2
+                    preitemag=i2
+                else:
+                    with torch.cuda.stream(s):
+                        num2=progress(i2,outarg_after)
+                    with torch.cuda.stream(s1):
+                        num1=progress(i1,outarg_after)
+                    prenuma2a=num2
+                    preitema2a=i2
+                    prenumag=num1
+                    preitemag=i1
+
+        
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.current_stream().wait_stream(s1)
+        output=torch.cat(outarg_after)
+        output=output.detach()
+        output.requires_grad=True
+        output=_BakByHand.apply(output,self)
+        self.input_tensors=input_tensors
+        self.output_tensors=output_tensors
+        return output
+        
+class _BakByHand(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx,  x,obj):
+        
+        ctx.obj=obj
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        ctx.obj.backward_with_order(grad_output)
+        return None,None
+
+@torch.jit.script
+def _capacity(gates: Tensor, capacity_factor: Tensor, min_capacity: Tensor) -> Tensor:
+    # gates has shape of SE
+    num_tokens = gates.shape[0]
+    num_experts = gates.shape[1]
+    # to(torch.int64) works around a bug in torch.onnx.export:
+    # it should cast k to int64 when converting torch.topk but it doesn't.
+    capacity = torch.ceil((num_tokens / num_experts) * capacity_factor).to(torch.int64)
+    if capacity < min_capacity:
+        capacity = min_capacity.to(torch.int64)
+    return capacity
+
+
+@torch.jit.script
+def _top_idx(source, k):
+    return torch.topk(source, k=k, dim=0)[1]
+
+
+@torch.jit.script
+def _one_hot_to_float(x, num_classes):
+    return F.one_hot(x, num_classes=num_classes).float()
+USE_EINSUM = True
+def einsum(rule, a, b):
+    if USE_EINSUM:
+        return torch.einsum(rule, a, b)
+    elif rule == 's,se->se':
+        return a.reshape(a.shape[0], -1) * b
+    elif rule == 'se,sc->sec':
+        return a.unsqueeze(2) * b.unsqueeze(1)
+    elif rule == 'se,se->s':
+        return torch.bmm(a.unsqueeze(1), b.unsqueeze(2)).reshape(-1)
+    elif rule == 'sec,sm->ecm':
+        s = a.shape[0]
+        e = a.shape[1]
+        c = a.shape[2]
+        m = b.shape[1]
+        return torch.matmul(a.reshape(s, -1).t(), b).reshape(e, c, m)
+    elif rule == 'sec,ecm->sm':
+        return torch.matmul(a.reshape(a.shape[0], -1), b.reshape(-1, b.shape[-1]))
+    elif rule == 'ks,ksm->sm':
+        k = b.shape[0]
+        s = b.shape[1]
+        m = b.shape[2]
+        # [k, s] -> [s, k] -> [s, 1, k]
+        a = a.t().unsqueeze(1)
+        # [k,s,m] -> [k, sm] -> [sm, k] -> [s, m, k]
+        b = b.reshape(k, -1).t().reshape(s, m, k)
+        # bmm([s, 1, k], [s, m, k]^t) -> [s, m, 1]
+        return torch.bmm(a, b.transpose(1, 2)).squeeze(2)
+    else:
+        return torch.einsum(rule, a, b)
+def _set_groups(**kwargs):
+    global _groups
+    _groups = kwargs
+
+
+def get_groups():
+    global _groups
+    return _groups
+def ensure_divisibility(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator."""
+    assert numerator % denominator == 0, '{} is not divisible by {}'.format(
+        numerator, denominator)
+def divide(numerator, denominator):
+    """Ensure that numerator is divisible by the denominator and return
+    the division value."""
+    ensure_divisibility(numerator, denominator)
+    return numerator // denominator
+def split_tensor_along_last_dim(tensor, num_partitions,
+                                contiguous_split_chunks=False):
+    """Split a tensor along its last dimension.
+    Arguments:
+        tensor: input tensor.
+        num_partitions: number of partitions to split the tensor
+        contiguous_split_chunks: If True, make each chunk contiguous
+                                 in memory.
+    """
+    # Get the size and dimension.
+    last_dim = tensor.dim() - 1
+    last_dim_size = divide(tensor.size()[last_dim], num_partitions)
+    # Split.
+    tensor_list = torch.split(tensor, last_dim_size, dim=last_dim)
+    # Note: torch.split does not create contiguous tensors by default.
+    if contiguous_split_chunks:
+        return tuple(chunk.contiguous() for chunk in tensor_list)
+
+    return tensor_list
+
+def moe_init(args):
+    # Create a comm prependicular to the pipeline group as gate group
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    for i in range(0, args.es_size):
+        ranks = range(i, world_size, args.es_size)
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            ep_group = group
+    for i in range(0, world_size, args.es_size):
+        ranks = range(i, i + args.es_size)
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            es_group = group
+    _set_groups(ep_group=ep_group, es_group=es_group)
+
+class Attention(nn.Module):
+    def __init__(self, args,mp_group) -> None:
+        super().__init__()
+
+        self.layer_norm=torch.nn.LayerNorm(args.M,eps=1e-5,elementwise_affine=True)
+        self.hidden_size=args.M
+        qkv_size_per_partition = (args.M// args.mp_size) * 3
+        out_size_per_partition = args.M // args.mp_size
+        
+       
+        self.attn_qkvw = nn.Parameter(0.001*torch.randn(qkv_size_per_partition,args.M).cuda(),
+                                    requires_grad=True)
+    
+        self.attn_qkvb = nn.Parameter(torch.zeros(qkv_size_per_partition).cuda(),
+                                    requires_grad=True)
+        
+        self.attn_ow = nn.Parameter(0.001*torch.randn(args.M,
+                                                out_size_per_partition ).cuda(),
+                                    requires_grad=True)
+
+        self.attn_ob = nn.Parameter(torch.zeros(args.M).cuda(),
+                                    requires_grad=True)
+        
+        self.num_attention_heads_per_partition = args.heads // args.mp_size
+        self.hidden_size_per_partition = args.M // args.mp_size
+        self.hidden_size_per_attention_head = args.M // args.heads
+
+        self.mp_group = mp_group
+        self.norm_factor=math.sqrt(args.M// args.heads)
+        self.attention_dropout = torch.nn.Dropout(0.2)
+    def forward(self,input):
+        seq=input.shape[1]
+        
+        norm_input=self.layer_norm(input)
+        
+        qkv_out=F.linear(norm_input,self.attn_qkvw,self.attn_qkvb)
+     
+        new_tensor_shape = qkv_out.size()[:-1] + \
+                (3,self.num_attention_heads_per_partition,self.hidden_size_per_attention_head)
+        mixed_x_layer = qkv_out.view(*new_tensor_shape)
+        mixed_x_layer=mixed_x_layer.permute(1,0,3,2,4).contiguous().view(new_tensor_shape[1],new_tensor_shape[0],new_tensor_shape[3],-1)
+        
+        (query_layer,
+        key_layer,
+        value_layer) = split_tensor_along_last_dim(mixed_x_layer, 3)
+      
+       
+        output_size = (query_layer.size(1),
+                    query_layer.size(2),
+                    query_layer.size(0),
+                    key_layer.size(0))
+        
+        # [sq, b, np, hn] -> [sq, b * np, hn]
+        query_layer = query_layer.view(output_size[2],
+                                    output_size[0] * output_size[1], -1)
+        # [sk, b, np, hn] -> [sk, b * np, hn]
+        key_layer = key_layer.view(output_size[3],
+                                output_size[0] * output_size[1], -1)
+        
+        # preallocting result tensor: [b * np, sq, sk]
+        matmul_result = torch.empty(
+            output_size[0]*output_size[1],
+            output_size[2],
+            output_size[3],
+            dtype=query_layer.dtype,
+            device=qkv_out.device)
+        
+
+        norm_factor=self.norm_factor
+        # Raw attention scores. [b * np, sq, sk]
+    
+        matmul_result = torch.baddbmm(
+            matmul_result,
+            query_layer.transpose(0, 1),   # [b * np, sq, hn]
+            key_layer.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+            beta=0.0, alpha=(1.0/norm_factor))
+        
+        # change view to [b, np, sq, sk]
+        attention_scores = matmul_result.view(*output_size)
+        attention_scores = attention_scores * (norm_factor)
+        if not hasattr(self, 'attention_mask'):
+            self.attention_mask = torch.tril(torch.ones(
+    (1, seq, seq), device=attention_scores.device)).view(
+            1, 1, seq, seq)
+            self.attention_mask = (self.attention_mask < 0.5)
+        attention_scores.masked_fill_(self.attention_mask, -10000.0)
+        attention_probs = torch.nn.Softmax(dim=-1)(attention_scores)
+        attention_probs=attention_probs.type(query_layer.dtype)
+        # attention_probs = self.attention_dropout(attention_probs)
+        # =========================
+        # Context layer. [sq, b, hp]
+        # =========================
+
+        # value_layer -> context layer.
+        # [sk, b, np, hn] --> [b, np, sq, hn]
+
+        # context layer shape: [b, np, sq, hn]
+        output_size = (value_layer.size(1),
+                    value_layer.size(2),
+                    query_layer.size(0),
+                    value_layer.size(3))
+
+        # change view [sk, b * np, hn]
+        value_layer = value_layer.view(value_layer.size(0),
+                                    output_size[0] * output_size[1], -1)
+        
+        # change view [b * np, sq, sk]
+        attention_probs = attention_probs.view(output_size[0] * output_size[1],
+                                            output_size[2], -1)
+
+        # matmul: [b * np, sq, hn]
+        context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
+
+        # change view [b, np, sq, hn]
+        context_layer = context_layer.view(*output_size)
+
+        # [b, np, sq, hn] --> [sq, b, np, hn]
+        context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
+
+        # [sq, b, np, hn] --> [sq, b, hp]
+        new_context_layer_shape = context_layer.size()[:-2] + \
+            (self.hidden_size_per_partition,)
+        context_layer = context_layer.view(*new_context_layer_shape)
+        
+        
+        context_layer=context_layer.permute(1,0,2)
+        output=F.linear(context_layer,self.attn_ow,self.attn_ob)
+        
+        res_input=input
+        if self.mp_group:
+            mp_rank=dist.get_rank(self.mp_group)
+            world_size=dist.get_world_size(self.mp_group)
+            rs_output=output.split(output.shape[1]//world_size,dim=1)[mp_rank]
+            res_input=res_input.split(res_input.shape[1]//world_size,dim=1)[mp_rank]
+        else:
+            rs_output=output
+        
+        return output,res_input,rs_output
+        
+class GshardGate(nn.Module):
+    def __init__(self, args) -> None:
+        super().__init__()
+        self.top_k = args.k
+        self.capacity_factor = args.f
+        self.wg = torch.nn.Linear(args.M, 128, bias=False)
+        self.config=args
+        # self.wg.weight.comm = "ep_group"
+    def topkgating(self,logits: Tensor,
+                min_capacity: int=1,
+                use_tutel: bool = True):
+        capacity_factor=self.capacity_factor
+        gates = F.softmax(logits, dim=1)
+        gates=gates.type(logits.dtype)
+        capacity = _capacity(gates,
+                            torch.tensor(capacity_factor),
+                            torch.tensor(min_capacity))
+        capacity=self.top_k*capacity
+        top_k = self.top_k
+        topk_indices = torch.topk(gates, self.top_k, dim=1).indices
+
+        indices_s = [x.view(-1) for x in topk_indices.chunk(top_k, dim=1)]
+        num_experts = int(gates.shape[1])
+        masks_se = [ F.one_hot(x, num_classes=num_experts).to(x.dtype) for x in indices_s]
+        gates_s = [(gates * x).sum(dim=1) for x in masks_se]
+
+        locations1 =  tutel_moe.fast_cumsum_sub_one(masks_se[0])
+
+        locations_s = [torch.sum(locations1 * masks_se[0], dim=1).to(torch.int32)]
+        if top_k > 1:
+            acc_base = None
+            for k in range(1, top_k):
+                acc_base = torch.sum(masks_se[k - 1], dim=0, keepdim=True) if acc_base is None else acc_base + torch.sum(masks_se[k - 1], dim=0, keepdim=True)
+                locations2 =  tutel_moe.fast_cumsum_sub_one(masks_se[k])
+                locations2 += acc_base
+                locations_s.append(torch.sum(locations2 * masks_se[k], dim=1).to(torch.int32))
+        else:
+            locations2 = locations1
+        locations2 = locations2[-1] + 1
+        indices_s = [x.to(torch.int32) for x in indices_s]
+        
+        num_samples = int(gates.size(0))
+        samples_per_expert = (num_samples + num_experts - 1) // num_experts
+
+        capacity = top_k * int(capacity_factor * samples_per_expert)
+        
+        return  capacity, num_experts, indices_s, locations_s, gates_s
+    
+    def top1gating(self,
+                logits: Tensor,
+                min_capacity: int=1,
+                use_tutel: bool = True):
+        capacity_factor=self.capacity_factor
+   
+        # everything is in fp32 in this function
+        gates = F.softmax(logits, dim=1)
+        gates=gates.type(logits.dtype)
+        capacity = _capacity(gates,
+                            torch.tensor(capacity_factor),
+                            torch.tensor(min_capacity))
+        capacity=self.top_k*capacity
+        # if (capacity%4)>0:
+        #     capacity+=(4-capacity%4) 
+        # Create a mask for 1st's expert per token
+        # noisy gating
+        indices1_s = torch.argmax( gates,
+            dim=1)
+        num_experts = int(gates.shape[1])
+        mask1 = F.one_hot(indices1_s, num_classes=num_experts)
+
+        mask1_rand = mask1
+
+        assert logits.shape[0] >= min_capacity, "No. of tokens (batch-size) should be greater than min_capacity. Either set min_capacity to 0 or increase your batch size."
+
+        top_idx = _top_idx(mask1_rand, capacity)
+
+        new_mask1 = mask1 * torch.zeros_like(mask1).scatter_(0, top_idx, 1)
+        mask1 = new_mask1
+
+        if use_tutel:
+            # Tutel doesn't support index values masked with zero
+            # so we need to replace masked indices with -1
+            indices_mask = mask1.sum(dim=1) * num_experts - 1
+            indices1_s = torch.min(indices1_s, indices_mask).type(logits.dtype)
+
+        # Compute locations in capacity buffer
+        if use_tutel:
+            locations1 = tutel_moe.fast_cumsum_sub_one(mask1)
+        else:
+            locations1 = torch.cumsum(mask1, dim=0) - 1
+
+        if use_tutel:
+            gates1_s = (gates * mask1).sum(dim=1).type(logits.dtype)
+            locations1_s = torch.sum(locations1 * mask1, dim=1).type(logits.dtype)
+
+            return  capacity, num_experts, [indices1_s,], [locations1_s,], [gates1_s,]
+
+        # Store the capacity location for each token
+        locations1_s = torch.sum(locations1 * mask1, dim=1)
+
+        # Normalize gate probabilities
+        mask1_float = mask1.float()
+        gates = gates * mask1_float
+
+        locations1_sc = _one_hot_to_float(locations1_s, capacity)
+        combine_weights = einsum("se,sc->sec", gates, locations1_sc)
+
+        dispatch_mask = combine_weights.bool()
+
+        return  combine_weights, dispatch_mask
+    def forward(self, inp):
+        
+        
+        inp=inp.view(-1,inp.shape[-1])
+        
+        logits = self.wg(inp)
+        return self.topkgating(logits)
+
+
+class Expert(nn.Module):
+    def __init__(self, args,num_local_expert=1) -> None:
+        super().__init__()
+        self.num_local_expert = num_local_expert
+        hidden_hidden_size = args.H
+        self.hidden_size = args.M
+       
+        self.expand_weight = nn.Parameter(
+                0.001*torch.rand(self.num_local_expert, self.hidden_size, hidden_hidden_size).cuda(),requires_grad=True
+            )
+        if args.ffn_type==1:
+            self.expand_weight1 = nn.Parameter(
+                    0.001*torch.rand(self.num_local_expert, self.hidden_size, hidden_hidden_size).cuda(),requires_grad=True
+                )
+        self.reduce_weight = nn.Parameter(
+                0.001*torch.rand(self.num_local_expert, hidden_hidden_size, self.hidden_size).cuda(),requires_grad=True
+            )
+        self.ffn_type=args.ffn_type
+        self.activation_fn = nn.GELU() if args.ffn_type==0 else nn.SiLU()
+
+    def forward(self, inp):
+
+        inp=inp.view(self.num_local_expert, -1, self.hidden_size)
+        out = torch.bmm(inp, self.expand_weight)
+        out = self.activation_fn(out)
+        if self.ffn_type==1:
+            out1=torch.bmm(inp, self.expand_weight1)
+            out=out*out1
+        out = torch.bmm(out, self.reduce_weight)
+        out = out
+        return out
+
+
+
+class MoeTransformer(nn.Module):
+
+    def __init__(self, args,mp_group=None,orders_unit=None):
+        super().__init__()
+        # self.attention=Attention(args,mp_group)
+        self.attention=Qwen3NextGatedDeltaNet(args,mp_group)
+        self.mp_group=mp_group
+        self.gate = GshardGate(args)
+        self.experts = Expert(args,2)
+        self.share_experts = Expert(args,2)
+        self.hidden_size = args.M
+        self.layer_norm=torch.nn.LayerNorm(args.M,eps=1e-5,elementwise_affine=True)
+        self.orders_unit=orders_unit
+
+    def mp_operate(self,attention_output,res_input,rs_output):
+        
+        if self.mp_group is not None:
+            mp_group = self.mp_group
+            list_size = dist.get_world_size(group=mp_group)
+            assert (
+                (attention_output.shape[0]*attention_output.shape[1]) % list_size == 0
+                and (attention_output.shape[0]*attention_output.shape[1]) >= list_size
+            )
+            rs_output=ori_reduce_scatter(mp_group,attention_output,rs_output,dim=1)
+           
+        return rs_output,res_input        
+    def simple_mp_operate(self,attention_output,res_input,rs_output):
+        
+        if self.mp_group is not None:
+            mp_group = self.mp_group
+            list_size = dist.get_world_size(group=mp_group)
+            assert (
+                (attention_output.shape[0]*attention_output.shape[1]) % list_size == 0
+                and (attention_output.shape[0]*attention_output.shape[1]) >= list_size
+            )
+            torch.distributed._reduce_scatter_base(rs_output, attention_output, group=mp_group)
+        else:
+            rs_output=attention_output
+        return rs_output,res_input
+    def simple_gate_op(self,rs_output,res_input):
+        attention_output=rs_output+res_input
+        
+        
+        self.attention_out_shape=list(attention_output.shape)
+        
+        attention_output=self.layer_norm(attention_output)
+        
+        attention_output=attention_output.view(-1,attention_output.shape[-1])
+
+        C, E, indices_, locations_, gates_=self.gate(attention_output)
+   
+        S, M = attention_output.size(0), attention_output.size(1)
+        if not hasattr(self, '_tutel_dispatcher'):
+            self._tutel_dispatcher = tutel_moe.fast_dispatcher(E, C,M,dispatch_dtype=attention_output.dtype)
+
+            self._tutel_dispatcher.update(indices_, locations_,gates_, capacity=C)
+            dispatched_input = self._tutel_dispatcher.encode(attention_output)
+            
+        else:
+            self._tutel_dispatcher.update(indices_, locations_,gates_, capacity=C)
+            dispatched_input = self._tutel_dispatcher.encode(attention_output)
+         
+        
+        return dispatched_input,E,C,M
+    def gate_op(self,rs_output,res_input):
+        
+        attention_output=rs_output+res_input
+       
+        
+        self.attention_out_shape=list(attention_output.shape)
+        
+        attention_output=self.layer_norm(attention_output)
+        norm_out = attention_output
+        attention_output=attention_output.view(-1,attention_output.shape[-1])
+
+        #combine_weights, dispatch_mask=self.gate(attention_output)
+        # dispatch_mask = dispatch_mask.to(attention_output.dtype).permute(1, 2, 0)  # S,E,C -> E,C,S
+        # E, C, S = dispatch_mask.size()
+        # # einsum("sec,sm->ecm")
+        # dispatched_input = torch.matmul(dispatch_mask, attention_output)
+        
+        C, E, indices_, locations_, gates_=self.gate(attention_output)
+        combine_weights = [ ]
+        for gate_ in gates_:
+            gate_=gate_.detach()
+            gate_.requires_grad=True
+            combine_weights.append(gate_)
+        S, M = attention_output.size(0), attention_output.size(1)
+        if not hasattr(self, '_tutel_dispatcher'):
+            self._tutel_dispatcher = [tutel_moe.fast_dispatcher(E, C,M,dispatch_dtype=attention_output.dtype) for _ in range(args.d2)]
+
+            self._tutel_dispatcher[self.gate_counts].update(indices_, locations_, combine_weights, capacity=C)
+            dispatched_input = self._tutel_dispatcher[self.gate_counts].encode(attention_output)
+            
+        else:
+            self._tutel_dispatcher[self.gate_counts].update(indices_, locations_, combine_weights, capacity=C)
+            dispatched_input = self._tutel_dispatcher[self.gate_counts].encode(attention_output)
+         
+        self.gate_counts+=1
+        output=torch.empty_like(dispatched_input)
+        
+        return dispatched_input,combine_weights,E,C,M,output,gates_,norm_out
+    def share_exp(self,norm_out):
+        share_out = self.share_experts(norm_out)
+        return share_out
+    def gather_op(self,dispatched_input,E,C,M):
+        output = self._tutel_dispatcher.decode(dispatched_input.view(E * C, M))
+        output=output.reshape(self.attention_out_shape)
+        tensor_list=torch.empty((output.shape[0],dist.get_world_size(group=self.mp_group) * output.shape[1],)+output.shape[2:], dtype=output.dtype, device=output.device)
+       
+        if self.mp_group is not None:
+            output=ori_gather(self.mp_group,output,1,tensor_list)
+
+        return output
+    def simple_gather_op(self,output,tensor_list):
+        if self.mp_group is not None:
+            ag_input=output
+         
+            # tensor_list=torch.empty((ag_input.shape[0],dist.get_world_size(group=self.mp_group) * ag_input.shape[1],)+ag_input.shape[2:], dtype=ag_input.dtype, device=ag_input.device)
+            self.mp_group._allgather_base(tensor_list,ag_input).wait()
+        else:
+            tensor_list=output
+        output=tensor_list
+        
+        return output
+
+    def before_gather(self,dispatched_input,combine_weights,E,C,M,share_out):
+        # output = combine_weights.view(S, E * C).mm(
+        #     dispatched_input.view(E * C, self.hidden_size)
+        # )
+        # output=output.reshape(self.attention_out_shape)
+        output = self._tutel_dispatcher[self.comb_counts].decode(dispatched_input.view(E * C, M))
+        
+        output=output.reshape(self.attention_out_shape)
+        share_out = share_out.view(self.attention_out_shape)
+     
+        output+=share_out
+        if self.mp_group is not None:
+            tensor_list=torch.empty((output.shape[0],dist.get_world_size(group=self.mp_group) * output.shape[1],)+output.shape[2:], dtype=output.dtype, device=output.device)
+        else:
+            tensor_list=None
+        self.comb_counts+=1
+        return (output,tensor_list)
+    def before_gather_bak(self,input_tensor, output_tensor, output_tensor_grad,item=6):
+        if self.mp_group is not None:
+            out=_split(self.mp_group,output_tensor_grad,dim=1)
+        else:
+            out=output_tensor_grad
+    
+        grad_outpus=self.backward_step(input_tensor, output_tensor, [out,None],6)
+        
+        return  *grad_outpus,torch.empty_like(grad_outpus[0])
+        
+    def backward_step(self,input_tensor, output_tensor, output_tensor_grad,item=0):
+
+        if isinstance(input_tensor,tuple):
+            input_tensor=list(input_tensor)
+        if isinstance(output_tensor,tuple):
+            output_tensor=list(output_tensor)
+        if isinstance(output_tensor_grad,tuple):
+            output_tensor_grad=list(output_tensor_grad)
+        # Retain the grad on the input_tensor.
+        unwrap_input_tensor_grad = False
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+            unwrap_input_tensor_grad = True
+        for x in input_tensor:
+            if x is not None and torch.is_tensor(x) and x.requires_grad:
+                x.retain_grad()
+            elif item == 6 and isinstance(x,list):
+                for small_x in x:
+                    small_x.retain_grad()
+                # if dist.get_rank()==0 and item == 6:
+                #     print(f"{x},{x.shape}")
+
+        if not isinstance(output_tensor, list):
+            output_tensor = [output_tensor]
+        if not isinstance(output_tensor_grad, list):
+            output_tensor_grad = [output_tensor_grad]
+
+        if item in [0]:
+            torch.autograd.backward(output_tensor[0:2], grad_tensors=output_tensor_grad[0:2])
+        elif item in [2]:
+            torch.autograd.backward([output_tensor[0]]+output_tensor[-2]+[output_tensor[-1]], grad_tensors=output_tensor_grad[0:1]+output_tensor_grad[1]+[output_tensor_grad[-1]])
+        else:
+            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+   
+
+        # Collect the grad of the input_tensor.
+        input_tensor_grad = [None]
+        if input_tensor is not None:
+            input_tensor_grad = []
+            for x in input_tensor:
+                if x is None or torch.is_tensor(x)==False or (x.requires_grad==False):
+                    if item == 6 and isinstance(x,list):
+                        tmp_g = []
+                        for small_x in x:
+                            tmp_g.append(small_x.grad)
+                        input_tensor_grad.append(tmp_g)
+                    else:
+                        input_tensor_grad.append(None)
+                else:
+                    input_tensor_grad.append(x.grad)
+                    
+        if item == 4:
+            input_tensor_grad[1]=output_tensor_grad[1]
+        if unwrap_input_tensor_grad:
+            input_tensor_grad = input_tensor_grad[0]
+        else:
+            input_tensor_grad= tuple(input_tensor_grad)
+       
+        # if debug:
+        #     if dist.get_rank()==0:
+        #         print(input_tensor_grad[0].size())
+        if item in [4]:
+            return *input_tensor_grad,torch.empty_like(input_tensor_grad[0])
+        return input_tensor_grad
+
+    def forward_with_order(self,inp):
+        self.gate_counts=0
+        self.comb_counts=0
+        global orders
+        global order_bak
+        func_list=[self.attention,self.simple_mp_operate,self.gate_op,self.simplea2a,self.expt,self.simplea2a,self.before_gather,self.simple_gather_op,self.share_exp]
+        bak_func_list=[self.backward_step,self.mp_bak,self.backward_step,self.a2a_bak,self.backward_step,self.a2a_bak,self.before_gather_bak,None,self.backward_step]
+
+        return self.orders_unit.forward_with_order(inp,func_list,orders,bak_func_list,order_bak)
+    def a2a_bak(self,input_tensor, output_tensor, output_tensor_grad,item=0):
+        return self.simplea2a(*output_tensor_grad)
+    def mp_bak(self,input_tensor, output_tensor, output_tensor_grad,item=0):
+        rs_output_g,res_input_g,tensor_list=output_tensor_grad
+        if self.mp_group is not None:
+            out=self.simple_gather_op(rs_output_g,tensor_list)
+        else:
+            out=rs_output_g
+        return out,res_input_g,None
+    def measure(self,x,flag=False):
+        
+        x1=(x,)
+        global e1
+        global e2
+        global e3
+        func_list=[self.attention,self.simple_mp_operate,self.gate_op,self.simplea2a,self.expt,self.simplea2a,self.before_gather,self.simple_gather_op]
+        times=np.array([0.0]*9)
+        # tmp_input=torch.rand(1).cuda()
+        # tmp_output=torch.rand(1).cuda()
+        for idx,func in enumerate(func_list):
+            self.gate_counts=0
+            self.comb_counts=0
+            # torch.cuda.synchronize()
+            # dist.all_to_all_single(tmp_output, tmp_input, None, None, _groups['ep_group'])
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+            
+            if idx==5:
+                x1tmp=x1
+            if idx==7:
+                x2tmp=x1
+            e1.record()
+            
+            x1=func(*x1)
+            # torch.distributed.barrier()
+            e2.record()
+            torch.cuda.synchronize()
+            t1=e1.elapsed_time(e2)
+            times[idx]=t1
+            if flag and idx==1:
+                return times
+
+        torch.distributed.barrier()
+        torch.cuda.synchronize()
+        e1.record()
+        global s
+        self.gate_counts=0
+        self.comb_counts=0
+        # if dist.get_rank()==0:
+        #     print(x2tmp[0].shape)
+        #     print(x1tmp[0].shape)
+        with torch.cuda.stream(s):
+            self.simple_gather_op(*x2tmp)
+        self.simplea2a(*x1tmp)
+        torch.cuda.current_stream().wait_stream(s)
+        # torch.distributed.barrier()
+        e2.record()
+        torch.cuda.synchronize()
+        times[8]=(e1.elapsed_time(e2))
+        return times
+
+    def simplea2a(self,dispatched_input,combine_weights,E,C,S,output,gates_=None):
+        # output = torch.empty_like(dispatched_input)
+        # torch.distributed.barrier()
+        dist.all_to_all_single(output, dispatched_input, None, None, _groups["ep_group"])
+        return output,combine_weights,E,C,S
+   
+    def expt(self,dispatched_input,combine_weights,E,C,S):
+        exp_out=self.experts(dispatched_input)
+        output = torch.empty_like(exp_out)
+        return exp_out,combine_weights,E,C,S,output
+    def forward(self,inp):
+        return self.forward_with_order(inp)
+        if args.d1>1 or args.orderT==1 or (args.d1==1 and args.d2==1):
+            return self.forward_with_order(inp)
+
+
+      
+        ####normal overlap(pipemoe/tutel)
+
+
+    
+        attention_out,res_inp,rs_out=self.attention(inp)
+
+        rs_out,res_inp=self.mp_operate(attention_out,res_inp,rs_out)
+
+        dispatched_input,E,C,S=self.simple_gate_op(rs_out,res_inp)
+        def expert_fn(expert_input):
+            return self.experts(expert_input).reshape(-1,expert_input.shape[-2],expert_input.shape[-1]).contiguous()
+        def a2a_fn(inputs):
+            output = torch.empty_like(inputs)
+            dist.all_to_all_single(output, inputs, None, None, _groups["ep_group"])
+            return output
+        dispatched_input = a2a_ffn_overlap_new(dispatched_input,expert_fn=expert_fn, a2a_ffn_overlap_degree=args.d2, a2afn=a2a_fn)
+
+        dispatched_input=self.gather_op(dispatched_input,E,C,S)
+
+
+        return dispatched_input
+
+def decorate_trace_handler(args, rank):
+    def trace_handler(prof):
+        # print(prof.key_averages().table(
+        #     sort_by="self_cuda_time_total", row_limit=-1))
+        if rank == 0:
+            # print(prof.events())
+            prof.export_chrome_trace(
+                "test{}.json".format(rank))
+    return trace_handler
+import os, time
+def mp_init(args):
+    mp_group=None
+    if args.mp_size==1:
+        return None
+    local_rank = int(os.getenv('LOCAL_RANK', '0'))
+    torch.cuda.set_device(local_rank)
+    num_tp_group=dist.get_world_size() // args.mp_size
+    for i in range(num_tp_group):
+        size=args.mp_size
+        tp_cnt=i*size
+        ranks=list(range(tp_cnt, tp_cnt + size))
+        _tp_group = dist.new_group(ranks)
+        if dist.get_rank() in ranks:
+            mp_group = _tp_group
+        
+    return mp_group
+def rerange_bak_orders(orders):
+
+    d1=0
+    d2=0
+    for item in orders:
+        if item==0:
+            d1+=1
+        if item==2:
+            d2+=1
+    out_order=[]
+    comp=[]
+    comm=[]
+    gate_pre=[0]*d1
+    rs_size_store=0
+    rs_count=0
+    base=d1*d2
+    rs_thr=base//d1
+    for i in range(d2):
+        rs_size_store+=base//d2
+        while rs_size_store>=rs_thr:
+            rs_size_store-=rs_thr
+            gate_pre[rs_count]=i
+            rs_count+=1
+    for item in orders:
+        if item in[0,2,4,6]:
+            comp.append(item)
+        else:
+            comm.append(item)
+    counts=[0]*9
+    comp_heads=0
+    comm_heads=0
+    len_comp=len(comp)
+    len_comm=len(comm)
+    debug=0
+    if dist.get_rank()==0:
+        print(orders)
+    while True:
+        debug+=1
+        # if dist.get_rank()==0 and debug<30:
+        #     print(out_order)
+        if len(out_order)==len(orders):
+            break
+        for i_m in range(comm_heads,len_comm+1):
+            if i_m==len_comm:
+                break
+            item=comm[i_m]
+          
+            num=counts[item]
+            if item==1:
+                
+                if counts[item+1]>gate_pre[num]:
+                    out_order.append(item)
+                    counts[item]+=1
+                else:
+                    break
+            elif counts[item+1]>num:
+                out_order.append(item)
+                counts[item]+=1
+            else:
+                break
+        comm_heads=i_m
+        if comp_heads<len_comp:
+            item2=comp[comp_heads]
+            n2=counts[item2]
+           
+            if item2==6 or counts[item2+1]>n2:
+                out_order.append(item2)
+                counts[item2]+=1
+                comp_heads+=1   
+    return out_order 
+def rerange_orders(orders):
+    d1=0
+    d2=0
+    for item in orders:
+        if item==0:
+            d1+=1
+        if item==2:
+            d2+=1
+    out_order=[]
+    comp=[]
+    comm=[]
+    gate_pre=[0]*d2
+    rs_size_store=0
+    rs_count=0
+    base=d1*d2
+    rs_thr=base//d2
+    for i in range(d1):
+        rs_size_store+=base//d1
+        while rs_size_store>=rs_thr:
+            rs_size_store-=rs_thr
+            gate_pre[rs_count]=i
+            rs_count+=1
+    for item in orders:
+        if item in[0,2,4,6]:
+            comp.append(item)
+        else:
+            comm.append(item)
+    counts=[0]*8
+    comp_heads=0
+    comm_heads=0
+    len_comp=len(comp)
+    len_comm=len(comm)
+    while True:
+        if len(out_order)==len(orders):
+            break
+        for i_m in range(comm_heads,len_comm+1):
+            if i_m==len_comm:
+                break
+            item=comm[i_m]
+            if item<10:
+                num=counts[item]
+                if counts[item-1]>num:
+                    out_order.append(item)
+                    counts[item]+=1
+                else:
+                    break
+            else:
+                i1=item//10
+                i2=item%10
+                n1=counts[i1]
+                n2=counts[i2]
+                if counts[i1-1]>n1 and counts[i2-1]>n2:
+                    out_order.append(item)
+                    counts[i1]+=1
+                    counts[i2]+=1
+                else:
+                    break
+        comm_heads=i_m
+        if comp_heads<len_comp:
+            item2=comp[comp_heads]
+            n2=counts[item2]
+            if item2==2:
+                if counts[item2-1]>gate_pre[n2]:
+                    out_order.append(item2)
+                    counts[item2]+=1
+                    comp_heads+=1
+            elif item2==0 or counts[item2-1]>n2:
+                out_order.append(item2)
+                counts[item2]+=1
+                comp_heads+=1
+    
+    return out_order
+def out_log(args,outtimes,forwardtimes,str_time_sets):
+    if dist.get_rank() == 0:
+        global output_file
+        # print(outtimes)
+        print("time cost of each component, copy and paste to opt_order.py line 727")
+        print(str_time_sets.strip('[').strip(' ').replace(' ',','))
+        # with open('test.log', 'a+') as f:
+        with open(output_file, "a+") as f:
+            f.write(
+                str(outtimes)
+                + ","
+                +str(forwardtimes)
+                + ","
+                + str(args.B)
+                + ","
+                + str(args.L)
+                + ","
+                + str(args.M)
+                + ","
+                + str(args.H)
+                + ","
+                + str(args.k)
+                + ","
+                + str(args.f)
+                + ","
+                + str(args.heads)
+                + ","
+                + str(args.mp_size)
+                + ","
+                + str(args.d1)
+                + ","
+                + str(args.d2)
+                + ','
+                +str(args.orderT)
+                +','
+                + str(str_time_sets)
+                + "\n"
+            )
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--local-rank", type=int)
+    parser.add_argument("--local_rank", type=int)
+    parser.add_argument("--measure_time", action="store_true")
+    parser.add_argument("--B", type=int)
+    parser.add_argument("--L", type=int)
+    parser.add_argument("--M", type=int)
+    parser.add_argument("--H", type=int)
+    parser.add_argument("--ffn_type", type=int,default=0) #0: 2ffn, 1: llama type
+    parser.add_argument("--att_type", type=int,default=0) #0: nromal, 2: flash
+    parser.add_argument("--heads", type=int)
+    parser.add_argument("--es_size", type=int, default=1)
+    parser.add_argument("--mp_size", type=int, choices=[1,2,4,8])
+    parser.add_argument("--k", type=int, default=6)
+    parser.add_argument("--f", type=float)
+    parser.add_argument("--d", type=str, default=None)
+    parser.add_argument("--d1", type=int, default=4)
+    parser.add_argument("--d2", type=int, default=4)
+    parser.add_argument("--v", type=int, default=0,choices=[0,1,2,3,4,5,6])
+    parser.add_argument("--orderT", type=int, choices=[0,1]) # choose the default order (0) or optimized order (1)
+    dct = {0: MoeTransformer, 1: MoeTransformer,2:MoeTransformer,3:MoeTransformer,4:MoeTransformer}
+    nae = {0: "test", 1: "imp1",2:"moeT"}
+    args = parser.parse_args()
+    
+    torch.cuda.set_device(args.local_rank)
+    dist.init_process_group(backend="nccl")
+    dist_rank = dist.get_rank()
+    if args.d is not None and args.d!='-1':
+        args.d1=int(args.d[0])
+        args.d2=int(args.d[1])
+    ####read orders
+    str_time_sets=""
+    world_size = dist.get_world_size()
+    order_path="orders"+str(world_size)+".txt"
+    if args.mp_size==1:
+        order_path="orders"+str(world_size)+"_mp1.txt"
+    if os.path.exists(order_path):
+        with open(order_path)as f:
+            lines=f.readlines()
+    else:
+        lines=[]
+    global orders
+    global order_bak
+    op_orders=[]
+    opb_orders=[]
+    d1_set=[8,8,8,8,4,4,4,4,2,2,2,2,1,1,1,1]
+    d2_set=[8,4,2,1,8,4,2,1,8,4,2,1,8,4,2,1]
+    dcounts=0
+    ocounts=0
+    m_t=0
+    for line in lines:
+        ocounts+=1
+        tmp=line.split('|')
+        seq,m1,h1,heads1,mp1=int(tmp[1]),int(tmp[2]),int(tmp[3]),int(tmp[6]),int(tmp[7])
+        odr=tmp[9].strip('\n').split(',')
+        if ocounts%2==0:
+       
+            if (args.L==seq)and  m1==args.M and h1==args.H and heads1==args.heads and mp1==args.mp_size:
+                if args.d1==d1_set[dcounts] and args.d2==d2_set[dcounts]:
+                    op_orders=np.array(podr).astype(np.int64)
+                    opb_orders=np.array(odr).astype(np.int64)
+                    m_t=pm_t
+                    break
+                else:
+                    dcounts+=1
+        pseq,pm1,ph1,pheads1,pmp1,podr=seq,m1,h1,heads1,mp1,odr
+        pm_t=float(tmp[8])
+        
+    input_d=args.orderT
+    d1=0
+    d2=0
+    if input_d==1:
+        
+        for item in op_orders:
+            if item==0:
+                d1+=1
+            if item ==2:
+                d2+=1
+        args.d1=d1
+        args.d2=d2
+    
+    
+    # print(dist_rank)
+    # exit(0)
+    global output_file
+    if args.measure_time:
+        if args.mp_size==1:
+            output_file ='measure_time_mp1'+".log"
+        else:
+            output_file ='measure_time'+".log"
+    else:
+        if dist.get_world_size() == 32 :
+            output_file="32configured_results.log"
+        elif dist.get_world_size() == 16 :
+
+            output_file="16configured_results.log" if args.v==0 else "16configured_results_2.log"
+        elif dist.get_world_size() == 8 :
+            output_file=str(args.v)+"8configured_results.log"
+        else:
+        # output_file = nae[args.v] + "_" + str(dist.get_world_size()) + ".log"
+            output_file = "configured_results.log"
+   
+    torch.manual_seed(772002 + dist_rank)
+    moe_init(args)
+
+    if dist.get_rank()==0:
+        print(op_orders)
+   
+    if dist.get_rank()==0:
+        print("rerange end")
+
+    global s
+    global s1
+    s1 = torch.cuda.Stream(priority=0)
+    s = torch.cuda.Stream(priority=0)
+    global events_list
+  
+    events_list=[[torch.cuda.Event(enable_timing=True) for _ in range(args.d1)]for _ in range(2)]+[[torch.cuda.Event(enable_timing=True) for _ in range(args.d2)]for _ in range(6)]
+    e1=torch.cuda.Event(enable_timing=True)
+    e2=torch.cuda.Event(enable_timing=True)
+    e3=torch.cuda.Event(enable_timing=True)
+    e4=torch.cuda.Event(enable_timing=True)
+    mp_group=mp_init(args)
+    x = torch.randn([args.B, args.L, args.M], dtype=torch.float32, device="cuda",requires_grad=True)
+    model = dct[args.v](args,mp_group,OrdersFunc(s,s1,args.d1,args.d2,mp_group,args.B,events_list)).cuda()
+    times = []
+    
+    
+    # output_file = "debug.log"
+    
+    
+    prof = torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    record_shapes=True,
+    with_stack=False,
+    with_modules=True,
+    schedule=torch.profiler.schedule(
+        wait=2,
+        warmup=2,
+        active=5),
+    on_trace_ready=decorate_trace_handler(args, dist.get_rank())
+    ) 
+    
+    ####measure
+    if args.measure_time:
+        xshape=x.shape
+        real_t1=[]
+        real_t2=[]
+        
+        xsplit1=x[:xshape[0]//args.d1]
+        xsplit2=x[:xshape[0]//args.d2]
+        
+        with torch.no_grad():
+            x1=xsplit1.detach()
+            xsplit1=xsplit2.detach()
+            model.eval()
+            for i in range(50):
+                t1=model.measure(x1,flag=True)
+                t2=model.measure(xsplit1)
+            
+                real_t1.append(t1)
+                real_t2.append(t2)
+        real_t1=np.array(real_t1)
+        real_t2=np.array(real_t2)
+        time_sets=[0]*9
+        time_sets[0]=trim_mean(real_t1[:,0],0.15)[0]
+        time_sets[1]=trim_mean(real_t1[:,1],0.15)[0]
+        for i in range(2,9):
+            time_sets[i]=trim_mean(real_t2[:,i],0.15)[0]
+        # real_t1=np.array(real_t1).mean(axis=0)
+        # real_t2=np.array(real_t2).mean(axis=0)
+        # time_sets=np.concatenate((real_t1[:2],real_t2[2:]),axis=0)
+        
+        # time_sets=torch.tensor(time_sets).cuda()
+        # print(str(time_sets[1])+','+str(dist.get_rank()))
+        # torch.distributed.all_reduce(time_sets)
+        # time_sets/=dist.get_world_size()
+        # time_sets=time_sets.detach().to('cpu').numpy()
+        str_time_sets="["
+        for item in time_sets:
+            str_time_sets=str_time_sets+str(item) +" "
+        out_log(args,0,0,str_time_sets)
+        exit(0)
+    # ####get default order
+    
+    tem_orders=[0,1]*args.d1+[2,3]*args.d2+[4,5]*args.d2+[6]*args.d2+[7]*args.d2
+    if args.mp_size==1 :
+        if args.d1==args.d2:
+            tem_orders=[0,1,2,3]*args.d1+[4,5]*args.d2+[6]*args.d2+[7]*args.d2
+        elif args.d1>args.d2:
+            tms=args.d1//args.d2
+            tem_orders=([0,1]*tms+[2,3])*args.d2+[4,5]*args.d2+[6]*args.d2+[7]*args.d2
+        else:
+            tms=args.d2//args.d1
+            tem_orders=([0,1]+[2,3]*tms)*args.d1+[4,5]*args.d2+[6]*args.d2+[7]*args.d2
+    tem_orders=rerange_orders(tem_orders)
+    def check_eq(o1,o2):
+        for it1,it2 in zip(o1,o2):
+            if it1!=it2:
+                return False
+        return True
+    if input_d==1 and (check_eq(tem_orders,op_orders) ) and check_eq(tem_orders,opb_orders):
+        if dist_rank == 0:
+            with open(output_file, "a+") as f:
+                f.write(
+                    str(0)
+                    + ","
+                    +str(0)
+                    + ","
+                    + str(args.B)
+                    + ","
+                    + str(args.L)
+                    + ","
+                    + str(args.M)
+                    + ","
+                    + str(args.H)
+                    + ","
+                    + str(args.k)
+                    + ","
+                    + str(args.f)
+                    + ","
+                    + str(args.heads)
+                    + ","
+                    + str(args.mp_size)
+                    + ","
+                    + str(args.d1)
+                    + ","
+                    + str(args.d2)
+                    + ','
+                    +str(input_d)
+                    +','
+                    + str(str_time_sets)
+                    + "\n"
+                )
+        exit(0)
+ 
+    order_list=[tem_orders,op_orders]
+
+    orders=order_list[input_d]
+
+    order_list_bak=[tem_orders,opb_orders]
+    order_bak_tp=order_list_bak[input_d]
+    order_bak=[]
+    len_orders=len(order_bak_tp)
+    # for i in range(len_orders):
+    #     if order_bak_tp[len_orders-1-i]>10:
+    #         i1=order_bak_tp[len_orders-1-i]//10
+    #         i2=order_bak_tp[len_orders-1-i]%10
+    #         item_s=i1 if i2==7 else i2
+    #         order_bak.append(item_s)
+    #     elif order_bak_tp[len_orders-1-i]==7:
+    #         pass
+    #     else:
+    #         order_bak.append(order_bak_tp[len_orders-1-i])
+    # order_bak = [7, 6, 7, 8, 6, 5, 8, 4, 5, 7, 4, 3, 7, 2, 6, 5, 8, 4, 6, 5, 8, 4, 3, 3, 1, 2, 2, 3, 0, 1, 1, 2, 0, 1, 0, 0]
+    # orders = [0, 0, 1, 2, 1, 0, 3, 0, 1, 2, 8, 2, 3, 4, 1, 8, 2, 5, 8, 6, 3, 4, 3, 4, 7, 4, 5, 5, 6, 6, 5, 8, 6, 7, 7, 7]
+    # orders =[0, 0, 1, 0, 1, 2, 8, 1, 0, 3, 2, 8, 1, 2, 8, 3, 4, 3, 2, 8, 5, 4, 3, 4, 5, 4, 5, 6, 6, 6, 7, 7, 7, 5, 6, 7]
+    # order_bak = [7, 6, 7, 6, 5, 4, 5, 7, 7, 6, 3, 4, 5, 6, 3, 4, 5, 8, 2, 3, 4, 8, 2, 3, 1, 8, 2, 1, 0, 1, 8, 2, 0, 1, 0, 0]
+    orders = [0,1,2,8,3,4,5,6,7]
+    order_bak = [7,6,5,4,3,8,2,1,0]
+    if dist.get_rank()==0:
+        # print(tem_orders)
+        # print(op_orders)
+        print(orders)
+        print(order_bak)
+    model.train()
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-4)
+    outtimes=[]
+    forwardtimes=[]
+  
+    x=x.cuda()
+   
+    test_timer=SynchronizedWallClockTimer()
+
+    
+    for i in range(50):
+        torch.distributed.barrier()
+        
+        
+        if dist.get_rank() == 0:
+            test_timer('forward').start()
+        
+       
+        # torch.cuda.synchronize()
+        output=model(x)
+        loss=output.mean()
+        loss.backward() 
+        
+        torch.cuda.synchronize()
+        if dist_rank == 0:
+            test_timer('forward').stop()
+            # print("step:", i)
+            prof.step()
+            pass
+        
+
+    if dist_rank == 0:
+        tmout=test_timer('forward').mean(0.2)
+        print(tmout)
+        outtimes,forwardtimes=tmout
+        # with open('test.log', 'a+') as f:
+        with open(output_file, "a+") as f:
+            f.write(
+                str(outtimes)
+                + ","
+                +str(forwardtimes)
+                + ","
+                + str(args.B)
+                + ","
+                + str(args.L)
+                + ","
+                + str(args.M)
+                + ","
+                + str(args.H)
+                + ","
+                + str(args.k)
+                + ","
+                + str(args.f)
+                + ","
+                + str(args.heads)
+                + ","
+                + str(args.mp_size)
+                + ","
+                + str(args.d1)
+                + ","
+                + str(args.d2)
+                + ','
+                +str(input_d)
+                +','
+                + str(str_time_sets)
+                + "\n"
+            )
+    del model
+    torch.cuda.empty_cache()
+    exit(0)
