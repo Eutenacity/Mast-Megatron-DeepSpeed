@@ -1,3 +1,7 @@
+We have open-sourced the Mast* version from the paper “Mast: Efficient training of mixture-of-experts transformers with task pipelining and ordering”. The code can be launched via `realworld.sh`, but you need to modify the corresponding CUDA path, dataset path, etc. `env.txt` contains the environment used. For Tutel, you can directly install it using `tutel-mast`, but you also need to modify the CUDA path in `setup.py`. The `'d1'` and `'d2'` in `transformer.py` represent the degree sizes in the paper and currently need to be set manually. `opt_order.py` can be used to obtain the task execution order.
+
+The open-source code is relatively rough and is provided for reference only. It will be polished in the future.
+
 ## Latest News
 * [2023/07] Synced with [upstream](https://github.com/NVIDIA/Megatron-LM) over 1k commits, see [rebase folder for more details](https://github.com/microsoft/Megatron-DeepSpeed/tree/main/examples_deepspeed/rebase) in terms of features and updated performance.
 
