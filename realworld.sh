@@ -1,7 +1,6 @@
-CUDA_HOME="/home/wenxianglin/spack/opt/spack/linux-ubuntu20.04-icelake/gcc-9.4.0/cuda-11.3.1-cfggi2tdhii3yzrjkaw4wkxrv4rcpody"
-CUDA_HOME=/home/wenxianglin/spack/opt/spack/linux-ubuntu20.04-icelake/gcc-9.4.0/cuda-12.1.1-ez4loay3afejb6o3ml5p45sgr7curufu
-CODE_PATH="/home/wenxianglin/Megatron-DeepSpeed-main"
-PYTHON_PATH="/home/wenxianglin/miniconda3/envs/lwxmast/bin/python"
+CUDA_HOME="/PATH/TO/CUDA"
+CODE_PATH="/PATH/TO/CODE"
+PYTHON_PATH="/PATH/TO/PYTHON"
 LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_HOME/lib64:/home/wenxianglin/openmpi/lib
 MASTER_ADD=ibgpu2
 run_cmd=" LD_LIBRARY_PATH=$LD_LIBRARY_PATH CUDA_HOME=$CUDA_HOME bash examples_deepspeed/MoE/ds_pretrain_gpt_1.3B_MoE128.sh"
