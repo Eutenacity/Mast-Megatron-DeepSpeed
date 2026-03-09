@@ -240,10 +240,10 @@ if [ "${USE_INTERNAL_DATA}" = "true" ]; then
     0.00208 ${NIH} 0.13017 ${CC2020} 0.09446 ${PCC} 0.15652 ${CC2021} \
     0.01359 ${ARX} 0.01588 ${GIT}"
 else
-    VOCAB_PATH=/home/wenxianglin/Megatron-DeepSpeed-main/gpt2-vocab.json
-    MERGE_PATH=/home/wenxianglin/Megatron-DeepSpeed-main/gpt2-merges.txt
+    VOCAB_PATH=gpt2-vocab.json
+    MERGE_PATH=gpt2-merges.txt
     # Public the Pile dataset, can be downloaded at https://mystic.the-eye.eu/public/AI/pile_neox/
-    DATA_PATH=/home/wenxianglin/Megatron-DeepSpeed-main/dataset/my-gpt2_text_document
+    DATA_PATH=dataset/my-gpt2_text_document
 fi
 ###############################################################################
 data_options=" \
